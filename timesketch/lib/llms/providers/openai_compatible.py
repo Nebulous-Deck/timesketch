@@ -42,6 +42,11 @@ class OpenAICompatible(interface.LLMProvider):
         api_key (str): API key for authentication.
         model (str): Model name/ID to use (e.g. "gpt-4o", "gpt-4o-mini").
         base_url (str): Base URL of the API (default: https://api.openai.com/v1).
+        structured_output (bool): Whether the endpoint supports the
+            ``response_format.type = "json_schema"`` Structured Outputs
+            feature (default: True).  Set to False for backends that do
+            not implement it — the provider will fall back to prompt-based
+            JSON instruction instead.
         timeout (int): Request timeout in seconds (default: 120).
     """
 
@@ -52,6 +57,7 @@ class OpenAICompatible(interface.LLMProvider):
         self.api_key = self.config.get("api_key")
         self.model = self.config.get("model")
         self.base_url = self.config.get("base_url", DEFAULT_BASE_URL).rstrip("/")
+        self.structured_output = self.config.get("structured_output", True)
         self.timeout = self.config.get("timeout", DEFAULT_TIMEOUT)
 
         if not self.api_key:
@@ -98,13 +104,22 @@ class OpenAICompatible(interface.LLMProvider):
         }
 
         if response_schema:
-            data["response_format"] = {
-                "type": "json_schema",
-                "json_schema": {
-                    "name": "response",
-                    "schema": response_schema,
-                },
-            }
+            if self.structured_output:
+                data["response_format"] = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "response",
+                        "schema": response_schema,
+                    },
+                }
+            else:
+                # Fallback: instruct the model via the prompt itself.
+                schema_str = json.dumps(response_schema)
+                data["messages"][0]["content"] = (
+                    f"{prompt}\n\nYou must respond with valid JSON matching "
+                    f"this schema: {schema_str}\n"
+                    f"Respond ONLY with the JSON, no other text."
+                )
 
         try:
             response = requests.post(
@@ -123,12 +138,31 @@ class OpenAICompatible(interface.LLMProvider):
 
         try:
             response_data = response.json()
-            text_response = (
-                response_data["choices"][0]["message"]["content"].strip()
-            )
+            message = response_data["choices"][0]["message"]
+
+            # Handle safety refusals (OpenAI returns message.refusal).
+            refusal = message.get("refusal")
+            if refusal:
+                raise ValueError(f"Model refused the request: {refusal}")
+
+            content = message.get("content")
+            if content is None:
+                raise ValueError(
+                    f"No content in response message: {response_data}"
+                )
+
+            # content can be a string or a list of content parts.
+            if isinstance(content, list):
+                text_response = "".join(
+                    part.get("text", "")
+                    for part in content
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ).strip()
+            else:
+                text_response = content.strip()
         except (KeyError, IndexError) as e:
             raise ValueError(
-                f"Unexpected response structure: {response.json()}"
+                f"Unexpected response structure: {response_data}"
             ) from e
 
         if response_schema:
